@@ -87,7 +87,14 @@ Source:
 Datos Argentina API / INDEC
 
 The API is queried with multiple series IDs simultaneously and `last=5`.
-This currently returns data through June 2026.
+Available values are retained even when other components are unpublished.
+The ETL logs missing series and periods, and fails if no usable observations
+remain. Before writing, it makes existing IPC value columns nullable (preserving
+their types and the date primary key). New missing values are stored as NULL;
+upserts preserve existing values when the source returns NULL. This schema
+change is committed with the IPC data and is a no-op on subsequent runs.
+Source availability must be checked at runtime; a successful run does not
+guarantee that Datos Argentina has republished the latest INDEC release.
 
 Do not assume the single-series endpoint response has the same freshness:
 we observed inconsistent behavior when querying the IPC general index alone.
