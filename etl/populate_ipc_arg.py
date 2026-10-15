@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
-from typing import Any
 
 import pandas as pd
 import requests
@@ -81,7 +80,23 @@ def fetch_ipc(last_periods: int = DEFAULT_LAST_PERIODS) -> pd.DataFrame:
     ipc = pd.DataFrame(data, columns=columns)
 
     ipc["fecha"] = pd.to_datetime(ipc["fecha"], errors="raise").dt.date
-    ipc = ipc.dropna().sort_values("fecha").reset_index(drop=True)
+    if ipc["fecha"].isna().any():
+        raise ValueError("Datos Argentina returned IPC observations without a date")
+
+    for column, series_id in IPC_SERIES.items():
+        missing = ipc.loc[ipc[column].isna(), "fecha"]
+        if not missing.empty:
+            LOGGER.warning(
+                "Missing IPC values for %s (%s): %s",
+                column, series_id, ", ".join(map(str, missing)),
+            )
+
+    # Components can be published at different times. Keep every available
+    # observation, including component revisions without a general index.
+    ipc = ipc.dropna(subset=list(IPC_SERIES), how="all")
+    ipc = ipc.sort_values("fecha").reset_index(drop=True)
+    if ipc.empty:
+        raise RuntimeError("Datos Argentina returned no usable IPC observations")
 
     LOGGER.info(
         "Fetched %s IPC periods from %s through %s",
@@ -93,19 +108,31 @@ def fetch_ipc(last_periods: int = DEFAULT_LAST_PERIODS) -> pd.DataFrame:
     return ipc
 
 
+def ensure_nullable_ipc_columns(db: DoltDBManager) -> None:
+    """Allow unpublished values while preserving column types and the date key."""
+    columns = db.query("SHOW COLUMNS FROM ipc_argentina")
+    changes = [
+        f"MODIFY COLUMN `{column['Field']}` {column['Type']} NULL"
+        for column in columns
+        if column["Field"] in IPC_SERIES and column["Null"] == "NO"
+    ]
+    if changes:
+        db.query("ALTER TABLE ipc_argentina " + ", ".join(changes))
+        LOGGER.info("Made %s IPC value columns nullable", len(changes))
+
+
 def upsert_ipc(db: DoltDBManager, ipc: pd.DataFrame) -> None:
     """
     Insert new IPC rows and update existing rows when published values change.
     """
     if ipc.empty:
-        LOGGER.info("No IPC observations to store")
-        return
+        raise RuntimeError("No usable IPC observations to store")
 
     value_columns = list(IPC_SERIES)
     columns = ["fecha", *value_columns]
     placeholders = ", ".join(["%s"] * len(columns))
     updates = ", ".join(
-        f"{column}=VALUES({column})"
+        f"{column}=COALESCE(VALUES({column}), {column})"
         for column in value_columns
     )
 
@@ -117,8 +144,11 @@ def upsert_ipc(db: DoltDBManager, ipc: pd.DataFrame) -> None:
 
     affected_rows = 0
 
-    for row in ipc.itertuples(index=False, name=None):
-        result = db.query(sql, row)
+    for row in ipc[columns].itertuples(index=False, name=None):
+        # PyMySQL cannot serialize pandas NaN. NULL represents an unpublished
+        # value on insert; COALESCE preserves existing values on update.
+        values = tuple(None if pd.isna(value) else value for value in row)
+        result = db.query(sql, values)
         affected_rows += result[0]["affected_rows"]
 
     LOGGER.info(
@@ -142,6 +172,7 @@ def main() -> None:
         db.connect()
 
         ipc = fetch_ipc(last_periods=last_periods)
+        ensure_nullable_ipc_columns(db)
         upsert_ipc(db, ipc)
 
         db.dolt_add("ipc_argentina")
